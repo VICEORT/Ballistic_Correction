@@ -1,5 +1,3 @@
-# 创建README说明文件
-cat > VIDEO_FILES_README.md << 'EOF'
 # 视频文件存储说明
 
 ## 文件已移出Git仓库
@@ -21,19 +19,6 @@ cat > VIDEO_FILES_README.md << 'EOF'
 
 这些文件已备份到本地目录：
 `~/armor_judge_videos_backup/`
-
-## 如果需要共享这些文件
-
-建议使用以下方式：
-1. **云存储服务**：Google Drive、OneDrive、百度网盘
-2. **物理传输**：U盘、移动硬盘
-3. **压缩后分享**：使用压缩软件分卷压缩
-
-## 项目结构变化
-
-- 代码和配置文件保留在Git仓库中
-- 大视频文件移至外部存储
-- 通过此文档记录文件信息
 
 ## 如何恢复
 
