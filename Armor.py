@@ -9,13 +9,27 @@ import sys
 
 # ================== CONFIG ==================
 MODEL_PATH = "best.onnx"
-VIDEO_PATH = "2月3日 总2.mp4"
+VIDEO_PATH = "12月19日 中石油 大工 2.mp4"
 
 INPUT_SIZE = 640
 ARMOR_CONF_THRES = 0.15
 BALL_CONF_THRES = 0.25
 ARMOR_ID = 0
 BALL_ID = 1
+
+# 可视化配置
+VISUALIZE_ALL_DETECTIONS = False  # 关闭所有原始检测显示
+VISUALIZE_LOW_CONF = 0.05
+VISUALIZE_KALMAN = False  # 关闭卡尔曼预测显示
+VISUALIZE_TRAJECTORY = True  # 保留轨迹显示
+
+# 轨迹筛选配置
+MAX_TRAJECTORY_ANGLE = 15  # 最大倾斜角度（度）
+MAX_HORIZONTAL_MOVE = 20  # 最大横向移动像素
+STAGNANT_FRAMES = 3  # 停滞帧数阈值
+STAGNANT_RADIUS = 30  # 停滞半径（像素）
+MIN_VERTICAL_SPEED = 2  # 最小垂直速度（像素/帧）
+MAX_BALL_ARMOR_AREA_RATIO = 0.5  # ball面积不能超过armor面积的一半
 
 VERT_DEVIATION_THRESH = 10
 VERT_TOL_FRAMES = 3
@@ -145,6 +159,108 @@ def is_trajectory_downward(trajectory, min_points=3):
     deltas = [ys[i+1] - ys[i] for i in range(len(ys)-1)]
     down_count = sum(1 for d in deltas if d >= 0)
     return down_count >= (len(deltas) / 2)
+
+def check_trajectory_horizontal_movement(trajectory, max_horizontal_move=20):
+    """检查轨迹是否有显著横向移动"""
+    if len(trajectory) < 2:
+        return True  # 太短，暂时通过
+    
+    xs = [p[0] for p in trajectory]
+    
+    # 检查任意两个连续点之间的横向移动
+    for i in range(1, len(xs)):
+        dx = abs(xs[i] - xs[i-1])
+        if dx > max_horizontal_move:
+            return False  # 横向移动过大
+    
+    # 检查总体横向偏移
+    total_horizontal_drift = abs(xs[-1] - xs[0])
+    if total_horizontal_drift > max_horizontal_move * 2:
+        return False
+    
+    return True
+
+def check_trajectory_stagnation(trajectory, stagnant_frames=3, stagnant_radius=30):
+    """检查轨迹是否在相近位置停滞"""
+    if len(trajectory) < stagnant_frames:
+        return True  # 太短，暂时通过
+    
+    # 检查最近N帧是否在同一位置
+    recent_points = trajectory[-stagnant_frames:]
+    
+    # 计算这些点的中心
+    center_x = sum(p[0] for p in recent_points) / len(recent_points)
+    center_y = sum(p[1] for p in recent_points) / len(recent_points)
+    
+    # 检查所有点是否都在半径范围内
+    all_within_radius = all(
+        np.sqrt((p[0] - center_x)**2 + (p[1] - center_y)**2) <= stagnant_radius
+        for p in recent_points
+    )
+    
+    if all_within_radius:
+        # 检查是否有足够的垂直移动
+        ys = [p[1] for p in recent_points]
+        vertical_movement = max(ys) - min(ys)
+        if vertical_movement < MIN_VERTICAL_SPEED * (stagnant_frames - 1):
+            return False  # 停滞了
+    
+    return True
+
+def check_trajectory_angle_consistency(trajectory, max_angle_deg=15, check_window=5):
+    """检查轨迹角度的连续性，防止突然转向"""
+    if len(trajectory) < 2:
+        return True
+    
+    # 检查每个小段的角度
+    for i in range(1, len(trajectory)):
+        x0, y0, _ = trajectory[max(0, i - check_window)]
+        x1, y1, _ = trajectory[i]
+        dx = x1 - x0
+        dy = y1 - y0
+        
+        if abs(dy) >= 5:  # 只在有明显垂直移动时检查
+            angle_rad = np.arctan2(dx, dy)
+            angle_deg = abs(np.degrees(angle_rad))
+            if angle_deg > max_angle_deg:
+                return False
+    
+    return True
+
+def validate_ball_trajectory(trajectory, new_point=None):
+    """
+    综合验证ball轨迹的有效性
+    返回: (is_valid, reason)
+    """
+    if new_point is not None:
+        test_trajectory = trajectory + [new_point]
+    else:
+        test_trajectory = trajectory
+    
+    if len(test_trajectory) < 2:
+        return True, "Too short"
+    
+    # 1. 检查是否垂直
+    if not is_trajectory_vertical(test_trajectory, max_angle_deg=MAX_TRAJECTORY_ANGLE):
+        return False, "Not vertical"
+    
+    # 2. 检查是否向下
+    if not is_trajectory_downward(test_trajectory):
+        return False, "Not downward"
+    
+    # 3. 检查横向移动
+    if not check_trajectory_horizontal_movement(test_trajectory, max_horizontal_move=MAX_HORIZONTAL_MOVE):
+        return False, "Horizontal movement"
+    
+    # 4. 检查是否停滞
+    if not check_trajectory_stagnation(test_trajectory, stagnant_frames=STAGNANT_FRAMES, stagnant_radius=STAGNANT_RADIUS):
+        return False, "Stagnation detected"
+    
+    # 5. 检查角度连续性
+    if not check_trajectory_angle_consistency(test_trajectory, max_angle_deg=MAX_TRAJECTORY_ANGLE):
+        return False, "Angle inconsistency"
+    
+    return True, "Valid"
 
 # ---------------- 增强的图像预处理 ----------------
 def preprocess_for_tracking(frame, bbox):
@@ -436,17 +552,20 @@ def main():
         output = compiled_model([input_tensor])[output_layer]
         pred = output[0]
 
-        # 解析检测结果
+        # 解析检测结果 - 保存所有检测用于可视化
+        all_raw_detections = {ARMOR_ID: [], BALL_ID: []}
         detections = {ARMOR_ID: [], BALL_ID: []}
+        
         for i in range(pred.shape[1]):
             cx, cy, w, h = pred[0:4, i]
             cls_scores = pred[4:, i]
             cls_id = int(np.argmax(cls_scores))
             conf = float(cls_scores[cls_id])
+            
             if cls_id not in (ARMOR_ID, BALL_ID):
                 continue
-            if (cls_id == ARMOR_ID and conf < ARMOR_CONF_THRES) or (cls_id == BALL_ID and conf < BALL_CONF_THRES):
-                continue
+            
+            # 计算图像坐标
             cx_img = (float(cx) - pad_x) / scale
             cy_img = (float(cy) - pad_y) / scale
             bw_img = float(w) / scale
@@ -462,14 +581,29 @@ def main():
             center_x = (x1 + x2) / 2.0
             center_y = (y1 + y2) / 2.0
             
+            # 保存所有原始检测（包括低置信度）
+            if conf >= VISUALIZE_LOW_CONF:
+                all_raw_detections[cls_id].append((x1, y1, x2, y2, conf, center_x, center_y))
+            
+            # 应用置信度阈值
+            if (cls_id == ARMOR_ID and conf < ARMOR_CONF_THRES) or (cls_id == BALL_ID and conf < BALL_CONF_THRES):
+                continue
+            
             # 置信度增强
+            original_conf = conf
             if predicted_center is not None:
                 dx = abs(center_x - predicted_center[0])
                 dy = abs(center_y - predicted_center[1])
                 if dx <= BOOST_RADIUS and dy <= BOOST_RADIUS:
                     conf = min(1.0, conf * BOOST_FACTOR)
             
-            detections[cls_id].append((x1, y1, x2, y2, conf, center_x, center_y))
+            detections[cls_id].append((x1, y1, x2, y2, conf, center_x, center_y, original_conf))
+
+        # ============ 可视化所有原始检测 ============
+        # 已关闭，不再显示低置信度检测
+
+        # ============ 可视化卡尔曼预测 ============
+        # 已关闭，不再显示卡尔曼预测
 
         # NMS过滤
         selected = {ARMOR_ID: [], BALL_ID: []}
@@ -481,28 +615,65 @@ def main():
                 for idx in keep_idx:
                     selected[cid].append(detections[cid][idx])
 
+        # ============ 可视化NMS后的检测 ============
+        # 不再显示置信度增强标注
+
         # 选择最佳检测
         best_armor = max(selected[ARMOR_ID], key=lambda x: x[4]) if selected[ARMOR_ID] else None
         yolo_ball = max(selected[BALL_ID], key=lambda x: x[4]) if selected[BALL_ID] else None
         
-        # 轨迹过滤
+        # 轨迹过滤 - 使用增强的验证逻辑
         filtered_yolo_ball = None
+        trajectory_filter_info = ""
+        trajectory_filter_reason = ""
+        
         if yolo_ball is not None:
-            bx1, by1, bx2, by2, bconf, bcx, bcy = yolo_ball
-            temp_traj = ball_trajectory.copy()
-            temp_traj.append((float(bcx), float(bcy), frame_idx + 1))
+            bx1, by1, bx2, by2, bconf, bcx, bcy, orig_conf = yolo_ball
             
-            # 1) 轨迹需近似竖直
-            vertical_check = is_trajectory_vertical(temp_traj, max_angle_deg=15)
-            # 2) 轨迹需为向下运动
-            downward_check = is_trajectory_downward(temp_traj)
-            # 3) 若已检测到装甲，则水平距离不能过大
+            # 创建新的测试点
+            new_point = (float(bcx), float(bcy), frame_idx + 1)
+            
+            # 综合验证轨迹
+            is_valid, reason = validate_ball_trajectory(ball_trajectory, new_point)
+            trajectory_filter_reason = reason
+            
+            # 额外检查1：与armor的水平距离
             horiz_check = True
+            horiz_dist = 0
             if best_armor is not None:
-                _, _, _, _, _, acx, _ = best_armor
-                horiz_check = abs(float(bcx) - float(acx)) <= 500
+                if len(best_armor) == 8:
+                    _, _, _, _, _, acx, _, _ = best_armor
+                else:
+                    _, _, _, _, _, acx, _ = best_armor
+                horiz_dist = abs(float(bcx) - float(acx))
+                horiz_check = horiz_dist <= 500
             
-            if vertical_check and downward_check and horiz_check:
+            # 额外检查2：ball面积不能超过armor面积的一半
+            area_check = True
+            ball_area = (bx2 - bx1) * (by2 - by1)
+            armor_area = 0
+            
+            if best_armor is not None:
+                if len(best_armor) == 8:
+                    ax1, ay1, ax2, ay2, _, _, _, _ = best_armor
+                else:
+                    ax1, ay1, ax2, ay2, _, _, _ = best_armor
+                armor_area = (ax2 - ax1) * (ay2 - ay1)
+                
+                if armor_area > 0:
+                    area_ratio = ball_area / armor_area
+                    area_check = area_ratio <= MAX_BALL_ARMOR_AREA_RATIO
+                    
+                    # 如果面积检查失败，记录原因
+                    if not area_check:
+                        trajectory_filter_reason = f"Ball too large ({area_ratio:.2f}x armor)"
+            
+            # 组合所有检查结果
+            final_valid = is_valid and horiz_check and area_check
+            
+            # 不再显示详细的过滤信息和拒绝原因
+            
+            if final_valid:
                 filtered_yolo_ball = yolo_ball
 
         frame_idx += 1
@@ -510,7 +681,11 @@ def main():
         # 当前帧的armor中心点
         current_armor_center = None
         if best_armor is not None:
-            _, _, _, _, _, acx, acy = best_armor
+            # 修复：best_armor可能有7或8个元素
+            if len(best_armor) == 8:
+                _, _, _, _, _, acx, acy, _ = best_armor
+            else:
+                _, _, _, _, _, acx, acy = best_armor
             current_armor_center = (float(acx), float(acy))
             last_armor_center = current_armor_center
         
@@ -520,7 +695,8 @@ def main():
         
         # 情况1: YOLO检测到ball
         if filtered_yolo_ball is not None:
-            bx1, by1, bx2, by2, yolo_conf, bcx, bcy = filtered_yolo_ball
+            # filtered_yolo_ball有8个元素
+            bx1, by1, bx2, by2, yolo_conf, bcx, bcy, orig_conf = filtered_yolo_ball
             
             # 情况1a: 同时有跟踪结果 -> 融合
             if track_detection is not None:
@@ -528,40 +704,41 @@ def main():
                 tcx, tcy = track_detection['center']
                 track_conf = track_detection['confidence']
                 
-                # 检查检测和跟踪结果的一致性
                 detection_center = np.array([float(bcx), float(bcy)])
                 track_center_array = np.array([tcx, tcy])
                 distance = np.linalg.norm(detection_center - track_center_array)
                 
-                if distance < 100:  # 距离阈值
-                    # 加权融合
+                # 可视化检测和跟踪的距离
+                cv2.line(frame, (int(bcx), int(bcy)), (int(tcx), int(tcy)), (255, 255, 0), 1)
+                mid_x, mid_y = (int(bcx) + int(tcx))//2, (int(bcy) + int(tcy))//2
+                cv2.putText(frame, f"Dist:{distance:.1f}", (mid_x, mid_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                
+                if distance < 100:
                     fusion_weight = HYBRID_FUSION_WEIGHT
                     fused_cx = fusion_weight * float(bcx) + (1 - fusion_weight) * tcx
                     fused_cy = fusion_weight * float(bcy) + (1 - fusion_weight) * tcy
-                    
-                    # 计算融合后的bbox
                     fused_w = (bx2 - bx1) * fusion_weight + (tx2 - tx1) * (1 - fusion_weight)
                     fused_h = (by2 - by1) * fusion_weight + (ty2 - ty1) * (1 - fusion_weight)
                     fused_x1 = fused_cx - fused_w/2
                     fused_y1 = fused_cy - fused_h/2
                     
+                    # best_ball只需要7个元素（不需要orig_conf）
                     best_ball = (int(fused_x1), int(fused_y1), 
                                 int(fused_x1 + fused_w), int(fused_y1 + fused_h),
                                 (yolo_conf + track_conf) / 2, fused_cx, fused_cy)
                     detection_source = "hybrid"
                     hybrid_confidence = (yolo_conf + track_conf) / 2
-                    
-                    # 更新跟踪器
                     hybrid_tracker.initialize(frame, (int(fused_x1), int(fused_y1), int(fused_w), int(fused_h)))
                 else:
-                    # 不一致，使用检测结果
-                    best_ball = filtered_yolo_ball
+                    # best_ball只需要7个元素
+                    best_ball = (bx1, by1, bx2, by2, yolo_conf, bcx, bcy)
                     detection_source = "yolo"
                     hybrid_confidence = yolo_conf
                     hybrid_tracker.initialize(frame, (bx1, by1, bx2-bx1, by2-by1))
             else:
-                # 情况1b: 只有检测结果
-                best_ball = filtered_yolo_ball
+                # best_ball只需要7个元素
+                best_ball = (bx1, by1, bx2, by2, yolo_conf, bcx, bcy)
                 detection_source = "yolo"
                 hybrid_confidence = yolo_conf
                 hybrid_tracker.initialize(frame, (bx1, by1, bx2-bx1, by2-by1))
@@ -572,17 +749,18 @@ def main():
             tcx, tcy = track_detection['center']
             track_conf = track_detection['confidence']
             
-            # 应用轨迹过滤到跟踪结果
             temp_traj = ball_trajectory.copy()
             temp_traj.append((tcx, tcy, frame_idx))
             
             if (is_trajectory_vertical(temp_traj, max_angle_deg=15) and
                 is_trajectory_downward(temp_traj)):
-                
                 best_ball = (int(x1), int(y1), int(x2), int(y2), track_conf, tcx, tcy)
                 detection_source = "tracker"
                 hybrid_confidence = track_conf * 0.8  # 跟踪结果置信度打折
         
+        # ============ 可视化实际轨迹 ============
+        # 不再显示绝对坐标系下的轨迹和轨迹点序号
+
         # 处理ball检测/跟踪结果
         if best_ball is not None:
             bx1, by1, bx2, by2, bconf, bcx, bcy = best_ball
@@ -592,16 +770,16 @@ def main():
             last_relative_disappearance_point = None
             class_counts[BALL_ID] += 1
             
-            # 绘制不同颜色的框表示不同的检测源
+            # 绘制ball识别框（保留）
             if detection_source == "yolo":
                 color = (0, 0, 255)  # 红色: YOLO检测
-                label = f"Ball(YOLO) {bconf:.2f}"
+                label = f"Ball {bconf:.2f}"
             elif detection_source == "tracker":
                 color = (255, 0, 0)  # 蓝色: 跟踪器
-                label = f"Ball(Track) {bconf:.2f}"
+                label = f"Ball {bconf:.2f}"
             else:  # hybrid
                 color = (0, 255, 255)  # 黄色: 融合结果
-                label = f"Ball(Hybrid) {bconf:.2f}"
+                label = f"Ball {bconf:.2f}"
             
             cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), color, 2)
             cv2.putText(frame, label, (int(bx1), max(0, int(by1) - 6)), 
@@ -617,14 +795,13 @@ def main():
                 pred_err = np.linalg.norm(np.array([float(bcx) - predicted_center[0], 
                                                     float(bcy) - predicted_center[1]]))
 
-            # 横向断开判定
-            if last_x is not None and abs(float(bcx) - last_x) > HORIZ_DISCONNECT_THRESH:
+            # 横向断开判定 - 使用更严格的阈值
+            if last_x is not None and abs(float(bcx) - last_x) > MAX_HORIZONTAL_MOVE * 2:
                 ball_kf = create_ca_ball_kf()
                 ball_kf.x = np.array([float(bcx), float(bcy), 0.0, 0.0, 0.0, 0.0])
                 ball_trajectory.clear()
                 ball_relative_trajectory.clear()
                 ball_trajectory.append((float(bcx), float(bcy), frame_idx))
-                # 计算相对坐标
                 if current_armor_center is not None:
                     rel_x = float(bcx) - current_armor_center[0]
                     rel_y = float(bcy) - current_armor_center[1]
@@ -654,7 +831,6 @@ def main():
                     ball_trajectory.clear()
                     ball_relative_trajectory.clear()
                     ball_trajectory.append((float(bcx), float(bcy), frame_idx))
-                    # 计算相对坐标
                     if current_armor_center is not None:
                         rel_x = float(bcx) - current_armor_center[0]
                         rel_y = float(bcy) - current_armor_center[1]
@@ -683,14 +859,22 @@ def main():
                         rel_y = float(bcy) - current_armor_center[1]
                         ball_relative_trajectory.append((rel_x, rel_y, frame_idx))
 
-                    # 轨迹追加
+                    # 轨迹追加 - 添加额外验证
                     if not ball_trajectory:
                         ball_trajectory.append((float(bcx), float(bcy), frame_idx))
                     else:
-                        if dy is None or dy >= 0:
-                            ball_trajectory.append((float(bcx), float(bcy), frame_idx))
-                        elif abs(dy) <= VERT_DEVIATION_THRESH and vertical_tolerant_count <= VERT_TOL_FRAMES:
-                            ball_trajectory.append((float(bcx), float(bcy), frame_idx))
+                        # 验证新点是否符合轨迹规则
+                        new_point = (float(bcx), float(bcy), frame_idx)
+                        is_valid, _ = validate_ball_trajectory(ball_trajectory, new_point)
+                        
+                        if is_valid:
+                            ball_trajectory.append(new_point)
+                        else:
+                            # 新点不符合规则，重新开始轨迹
+                            ball_trajectory.clear()
+                            ball_trajectory.append(new_point)
+                            ball_kf = create_ca_ball_kf()
+                            ball_kf.x = np.array([float(bcx), float(bcy), 0.0, 0.0, 0.0, 0.0])
 
             # 限制轨迹长度
             if len(ball_trajectory) > 100:
@@ -724,24 +908,35 @@ def main():
 
         # 处理armor检测
         if best_armor is not None:
-            ax1, ay1, ax2, ay2, aconf, acx, acy = best_armor
-            rx1, ry1, rx2, ry2 = max(0, ax1), max(0, ay1), min(w0 - 1, ax2), min(h0 - 1, ay2)
-            if rx2 > rx1 and ry2 > ry1:
-                roi = frame[ry1:ry2, rx1:rx2]
-                optimized_boxes, mask = optimize_armor_box(roi)
+            # 修复：统一处理armor元组
+            if len(best_armor) == 8:
+                ax1, ay1, ax2, ay2, aconf, acx, acy, _ = best_armor
             else:
-                optimized_boxes, mask = [], None
+                ax1, ay1, ax2, ay2, aconf, acx, acy = best_armor
+            
+            # 绘制armor识别框（保留）
             cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
             cv2.putText(frame, f"Armor {aconf:.2f}", (ax1, max(0, ay1 - 8)), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # 检查ball是否消失
+            # 检查ball是否消失 - 新逻辑：基于消失点判断Position
             if frames_no_ball >= DISAPPEAR_FRAMES and (not disappearance_handled) and len(ball_trajectory) > 0:
                 last_x, last_y, _ = ball_trajectory[-1]
-                if last_y < ay1:
+                
+                # 新逻辑：根据消失点相对于armor下边缘的位置判断
+                # 消失点在下边缘以上 -> Back
+                # 消失点在下边缘以下 -> Front
+                # 只有这两种情况才有效，否则为miss
+                if last_y < ay2:
+                    # 消失点在armor下边缘以上
                     last_position = 'Back'
-                elif last_y > ay2:
+                elif last_y >= ay2:
+                    # 消失点在armor下边缘以下（包括下边缘）
                     last_position = 'Front'
+                else:
+                    # 这个else实际上不会被触发，但保留以防万一
+                    last_position = 'Miss'
+                
                 prev_trajectory = ball_trajectory.copy()
                 prev_relative_trajectory = ball_relative_trajectory.copy()
                 last_disappearance_point = (last_x, last_y)
@@ -755,7 +950,7 @@ def main():
                 ball_trajectory.clear()
                 ball_relative_trajectory.clear()
 
-            # 状态信息显示
+            # 状态信息显示（保留左上角文字）
             status_lines = []
             
             # 添加跟踪源信息
@@ -780,7 +975,6 @@ def main():
             if ball_center is not None:
                 armor_center = (acx, acy)
                 horizontal_diff = ball_center[0] - armor_center[0]
-                pred_conf = calculate_confidence(bconf if best_ball is not None else 0.0, aconf)
                 if best_ball is not None:
                     last_diff = horizontal_diff
                 if last_diff is not None:
@@ -788,23 +982,19 @@ def main():
                 else:
                     status_lines.append(("Diff: N/A", (0, 255, 0)))
                 
+                # Horizontal判断保持不变
                 if best_ball is not None:
                     bx = ball_center[0]
                     last_horizontal = 'true' if (ax1 <= bx <= ax2) else 'Fault'
+                
+                # Position判断：实时显示ball位置，但不影响最终判断
+                # 最终判断只在消失时才设定
                 if best_ball is not None:
-                    if bcy > ay2:
-                        last_position = 'Front'
-                        ball_was_below = True
-                        back_reported = False
+                    # 实时显示当前位置（仅供参考）
+                    if bcy < ay2:
+                        current_position_display = 'Above Bottom'
                     else:
-                        last_position = 'Back'
-                else:
-                    if ball_center[1] > ay2:
-                        last_position = 'Front'
-                        ball_was_below = True
-                        back_reported = False
-                    else:
-                        last_position = 'Back'
+                        current_position_display = 'Below Bottom'
             else:
                 if last_diff is not None:
                     status_lines.append((f"Diff: {last_diff:.2f}", (0, 255, 0)))
@@ -814,18 +1004,24 @@ def main():
             if last_horizontal is not None:
                 color_h = (0, 255, 0) if last_horizontal == 'true' else (0, 0, 255)
                 status_lines.append((f"Horizontal: {last_horizontal}", color_h))
-            if ball_was_below and frames_no_ball >= 3 and not back_reported:
-                last_position = 'Back'
-                back_reported = True
+            
+            # Position显示：只显示有效判断结果
             if last_position is not None:
-                color_p = (0, 255, 0) if last_position == 'Front' else (0, 0, 255)
+                if last_position in ['Front', 'Back']:
+                    color_p = (0, 255, 0) if last_position == 'Front' else (0, 0, 255)
+                else:
+                    # Miss情况用灰色
+                    color_p = (128, 128, 128)
                 status_lines.append((f"Position: {last_position}", color_p))
+            else:
+                status_lines.append(("Position: Waiting", (200, 200, 200)))
 
+            # 绘制左上角状态文字（保留）
             draw_status_texts(frame, status_lines, x=10, y=30, line_height=20, font_scale=0.6)
             
-            # 绘制相对于armor的轨迹
+            # 绘制armor坐标系下的轨迹（保留）
             if current_armor_center is not None:
-                # 绘制历史相对轨迹
+                # 绘制历史相对轨迹（灰色）
                 if prev_relative_trajectory and len(prev_relative_trajectory) > 1:
                     for i in range(1, len(prev_relative_trajectory)):
                         rel_x1, rel_y1, _ = prev_relative_trajectory[i - 1]
@@ -839,7 +1035,7 @@ def main():
                         
                         cv2.line(frame, (int(abs_x1), int(abs_y1)), (int(abs_x2), int(abs_y2)), (160, 160, 160), 2)
                     
-                    # 绘制历史消失点
+                    # 绘制历史消失点（红色圆圈）
                     if last_relative_disappearance_point is not None:
                         rel_dx, rel_dy = last_relative_disappearance_point
                         abs_dx = current_armor_center[0] + rel_dx
@@ -849,7 +1045,7 @@ def main():
                         cv2.putText(frame, "Disappear", (int(abs_dx) + 8, int(abs_dy) - 8), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 
-                # 绘制当前相对轨迹
+                # 绘制当前相对轨迹（黄色）
                 if len(ball_relative_trajectory) > 1:
                     for i in range(1, len(ball_relative_trajectory)):
                         rel_x1, rel_y1, _ = ball_relative_trajectory[i - 1]
@@ -863,19 +1059,19 @@ def main():
                         
                         cv2.line(frame, (int(abs_x1), int(abs_y1)), (int(abs_x2), int(abs_y2)), (0, 255, 255), 2)
                     
-                    # 绘制当前轨迹的最新点
+                    # 绘制当前轨迹的最新点（绿色圆点）
                     if ball_relative_trajectory:
                         rel_lx, rel_ly, _ = ball_relative_trajectory[-1]
                         abs_lx = current_armor_center[0] + rel_lx
                         abs_ly = current_armor_center[1] + rel_ly
                         cv2.circle(frame, (int(abs_lx), int(abs_ly)), 4, (0, 255, 0), -1)
 
-        # 显示帧率
+        # 显示帧率（保留）
         fps_text = f"FPS: {1/(time.time()-t0+1e-6):.1f}"
         cv2.putText(frame, fps_text, (w0 - 120, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        cv2.imshow("Hybrid Tracking - Real-time Detection", frame)
+        cv2.imshow("Armor Judge - Detection", frame)
 
         t1 = time.time()
         frame_times.append(t1 - t0)
